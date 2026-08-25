@@ -1,130 +1,145 @@
-/**
- * voice.js
- * Handles all audio I/O:
- *   STT  — Deepgram real-time transcription (mulaw 8kHz from Twilio)
- *   TTS  — ElevenLabs streaming synthesis (ulaw_8000 back to Twilio)
- */
-
+/** Real-time STT and Twilio-compatible TTS. */
 require('dotenv').config();
-const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
+const WebSocket = require('ws');
 const axios = require('axios');
 
-const deepgramClient = createClient(process.env.DEEPGRAM_API_KEY);
-
-/**
- * Creates a Deepgram live transcription session.
- * Audio format matches Twilio Media Streams: mulaw, 8000 Hz, 1 channel.
- *
- * @param {function} onTranscript  - Called with (text, isFinal)
- * @returns {{ sendAudio, close }}
- */
 function createSTT(onTranscript) {
-  const connection = deepgramClient.listen.live({
-    model: 'nova-2',
-    language: 'en-IN',          // English, India locale
-    encoding: 'mulaw',
-    sample_rate: 8000,
-    channels: 1,
-    punctuate: true,
-    interim_results: true,
-    utterance_end_ms: 1000,     // 1 second of silence = end of utterance
-    vad_events: true,
-    endpointing: 300,
+  const url =
+    'wss://api.deepgram.com/v1/listen' +
+    '?model=nova-3' +
+    '&language=multi' +
+    '&encoding=mulaw' +
+    '&sample_rate=8000' +
+    '&channels=1' +
+    '&punctuate=true' +
+    '&smart_format=true' +
+    '&interim_results=true' +
+    '&utterance_end_ms=1000' +
+    '&vad_events=true' +
+    '&endpointing=300';
+
+  console.log('[Deepgram] Connecting to live STT...');
+
+  const connection = new WebSocket(url, {
+    headers: {
+      Authorization: `Token ${process.env.DEEPGRAM_API_KEY}`,
+    },
   });
 
-  connection.on(LiveTranscriptionEvents.Open, () => {
-    console.log('[Deepgram] Connection open');
+  let opened = false;
+
+  connection.on('open', () => {
+    opened = true;
+    console.log('[Deepgram] Connected to live STT');
   });
 
-  connection.on(LiveTranscriptionEvents.Transcript, (data) => {
-    const alt = data?.channel?.alternatives?.[0];
-    if (!alt || !alt.transcript) return;
+  connection.on('message', (raw) => {
+    try {
+      const data = JSON.parse(raw.toString());
 
-    const text = alt.transcript.trim();
-    const isFinal = data.is_final;
+      if (data.type === 'Results') {
+        const transcript = data?.channel?.alternatives?.[0]?.transcript?.trim();
+        if (!transcript) return;
 
-    if (text.length > 0) {
-      onTranscript(text, isFinal);
+        console.log(
+          `[Deepgram] Transcript (${data.is_final ? 'final' : 'interim'}):`,
+          transcript
+        );
+
+        onTranscript(
+          transcript,
+          Boolean(data.is_final),
+          false
+        );
+      }
+
+      if (data.type === 'UtteranceEnd') {
+        console.log('[Deepgram] Utterance end');
+        onTranscript('', false, true);
+      }
+    } catch (error) {
+      console.error('[Deepgram] Message parse error:', error.message);
     }
   });
 
-  connection.on(LiveTranscriptionEvents.UtteranceEnd, () => {
-    // Signal utterance end so agent can process even if Deepgram didn't mark final
-    onTranscript('', true, true /* utteranceEnd */);
+  connection.on('error', (error) => {
+    console.error('[Deepgram] WS error:', error.message);
   });
 
-  connection.on(LiveTranscriptionEvents.Error, (err) => {
-    console.error('[Deepgram] Error:', err);
-  });
-
-  connection.on(LiveTranscriptionEvents.Close, () => {
-    console.log('[Deepgram] Connection closed');
+  connection.on('close', (code, reason) => {
+    console.log('[Deepgram] Closed:', code, reason?.toString());
+    opened = false;
   });
 
   return {
-    sendAudio: (chunk) => {
-      if (connection.getReadyState() === 1 /* OPEN */) {
+    sendAudio(chunk) {
+      if (opened && connection.readyState === WebSocket.OPEN) {
         connection.send(chunk);
       }
     },
-    close: () => {
-      try { connection.finish(); } catch (_) {}
+
+    close() {
+      try {
+        if (
+          connection.readyState === WebSocket.OPEN ||
+          connection.readyState === WebSocket.CONNECTING
+        ) {
+          connection.close();
+        }
+      } catch (_) {}
     },
   };
 }
 
-/**
- * Converts text to speech using ElevenLabs streaming API.
- * Returns a Buffer of mulaw 8kHz audio ready to stream to Twilio.
- *
- * @param {string} text
- * @returns {Promise<Buffer>}
- */
 async function textToSpeech(text) {
   const voiceId = process.env.ELEVENLABS_VOICE_ID;
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
+
+  if (!voiceId || !process.env.ELEVENLABS_API_KEY) {
+    throw new Error('ElevenLabs credentials are missing');
+  }
 
   const response = await axios.post(
-    url,
+    `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`,
     {
       text,
-      model_id: 'eleven_turbo_v2',     // Lowest latency model
-      output_format: 'ulaw_8000',       // Twilio-native format, no conversion needed
+      model_id: 'eleven_flash_v2_5',
       voice_settings: {
         stability: 0.45,
         similarity_boost: 0.75,
-        style: 0.3,
+        style: 0.25,
         use_speaker_boost: true,
       },
     },
     {
+      params: {
+        output_format: 'ulaw_8000',
+      },
       headers: {
         'xi-api-key': process.env.ELEVENLABS_API_KEY,
         'Content-Type': 'application/json',
-        Accept: 'audio/basic',
       },
       responseType: 'arraybuffer',
-      timeout: 8000,
+      timeout: 12000,
     }
   );
 
   return Buffer.from(response.data);
 }
 
-/**
- * Converts a TTS audio buffer into Twilio-compatible media payload chunks.
- * Twilio expects base64-encoded mulaw audio in chunks of ~20ms (160 bytes at 8kHz).
- *
- * @param {Buffer} audioBuffer
- * @returns {string[]}  Array of base64 strings (one per 20ms chunk)
- */
 function audioToTwilioChunks(audioBuffer) {
-  const CHUNK_SIZE = 160; // 20ms at 8kHz
   const chunks = [];
-  for (let i = 0; i < audioBuffer.length; i += CHUNK_SIZE) {
-    chunks.push(audioBuffer.slice(i, i + CHUNK_SIZE).toString('base64'));
+
+  for (let offset = 0; offset < audioBuffer.length; offset += 160) {
+    chunks.push(
+      audioBuffer.subarray(offset, offset + 160).toString('base64')
+    );
   }
+
   return chunks;
 }
 
-module.exports = { createSTT, textToSpeech, audioToTwilioChunks };
+module.exports = {
+  createSTT,
+  textToSpeech,
+  audioToTwilioChunks,
+};

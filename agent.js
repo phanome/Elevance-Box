@@ -1,328 +1,149 @@
-/**
- * agent.js
- * Core AI agent — orchestrates STT, LLM, TTS, classification, and mid-call actions.
- * LLM: Groq (free) running Llama 3.3 70B — OpenAI-compatible API, zero cost.
- *
- * Flow per WebSocket connection:
- *   1. Twilio sends start event → capture streamSid, greet caller
- *   2. Twilio sends audio chunks → Deepgram transcribes in real-time
- *   3. On final transcript → GPT-4o processes → classify intent
- *   4. If HOT → fire mid-call WhatsApp immediately
- *   5. If callback mentioned → schedule callback
- *   6. GPT-4o response → ElevenLabs → stream audio back to Twilio
- *   7. Call ends → send follow-up WhatsApp with full context
- */
-
+/** The per-call conversation state, sales qualification and live actions. */
 require('dotenv').config();
 const Groq = require('groq-sdk');
 const { createSTT, textToSpeech, audioToTwilioChunks } = require('./voice');
 const { sendMidCallWhatsApp, sendFollowUpWhatsApp } = require('./whatsapp');
 const { scheduleCallback, hasCallbackRequest } = require('./scheduler');
-
-// Groq is 100% free — sign up at groq.com, no credit card needed
+const { deriveLeadSignal, normalizeClassification } = require('./lead');
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-// ─── System prompt ────────────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `You are Priya, a friendly and professional sales representative from WebCraft Solutions.
-You are calling a potential client to introduce professional e-commerce website development services.
+const SYSTEM_PROMPT = `You are Priya, a warm Indian sales representative for WebCraft Solutions. You are on a live phone call offering custom e-commerce website development.
 
-LANGUAGE RULE: Speak ONLY in English. Do not switch to any other language under any circumstances.
+LANGUAGE: Detect the caller's language from their first real reply. Speak in that same language: English, Hindi, Telugu, or their natural mix. Do not translate their words unnecessarily. Use simple, conversational phone language.
 
-YOUR GOAL:
-- Have a natural, human-sounding conversation (not a robotic script)
-- Gently uncover the prospect's needs: what they sell, their budget, how many products, timeline, features they need
-- Pitch e-commerce website development as the solution to their business goals
-- Never fire questions like a list — weave them naturally into conversation
-- Handle vague answers gracefully ("my budget is flexible" → ask a range)
+GOAL: Qualify naturally by learning what they sell, approximate product count, budget, launch timeline and important features (payments, catalogue, delivery, admin panel, etc.). Pitch only what is relevant. Ask no more than one question at a time. Be concise: one or two short sentences.
 
-CLASSIFICATION (internal — never say these words out loud):
-After EVERY user message, decide their intent:
-  HOT  → Asking about price, timeline, ready to proceed, saying "yes let's do it", "how much", "when can you start"
-  WARM → Interested but has a barrier: budget concerns, needs time to decide, decision-maker is someone else
-  COLD → Just curious, no real need, shutting down the conversation
+LEAD INTENT CLASSIFICATION (never say the label aloud):
+- HOT: High buying intent shown through indirect or direct cues like asking price/rates/charges, how soon you can start, "send me the details/proposal on WhatsApp", wanting to proceed, or asking for samples/quotes.
+- WARM: Real interest but has a barrier: budget constraint ("budget is tight", "not much budget"), timing ("call me tomorrow", "busy right now"), or another decision maker ("brother handles this", "need to discuss with my partner").
+- COLD: No need, just browsing, not interested, or asking to stop calling.
 
-ACTIONS (respond with JSON when taking an action, otherwise respond with plain speech):
+Return ONLY valid JSON on every turn:
+{"speech":"words to say aloud","classification":"HOT|WARM|COLD","action":"none|schedule_callback","actionContext":"exact buying-intent phrase or null","budget":"value or null","products":"what they sell and/or product count or null","timeline":"value or null","features":"value or null","callbackTime":"spoken callback time or null"}
 
-When you speak to the user, respond with EXACTLY this JSON:
-{
-  "speech": "What you want to say out loud",
-  "classification": "HOT" | "WARM" | "COLD",
-  "action": "none" | "whatsapp" | "schedule_callback",
-  "actionContext": "The sentence(s) that triggered this action (if any)",
-  "budget": "extracted budget or null",
-  "timeline": "extracted timeline or null",
-  "features": "extracted features or null",
-  "callbackTime": "natural language time if scheduling, or null"
+For CALL_STARTED, greet once in English and invite them to continue in English, Hindi or Telugu: "Hi, I’m Priya from WebCraft Solutions. Is this a good time for a quick chat about putting your products online? I can speak English, Hindi, or Telugu."`;
+
+function safeJson(raw) {
+  const text = String(raw || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+  const candidate = text.match(/\{[\s\S]*\}/)?.[0] || text;
+  try { return JSON.parse(candidate); }
+  catch (_) { return { speech: String(raw || 'Could you please repeat that?'), classification: 'WARM', action: 'none' }; }
 }
 
-CONVERSATION STYLE:
-- Sound like a real person calling from a phone
-- Keep responses SHORT — 1-3 sentences max per turn
-- Do NOT over-explain or list things
-- It is okay to be slightly warm and personable
-- If they seem busy, offer to call back
-
-OPENING LINE (first message, use this verbatim):
-"Hi, am I speaking with the right person? I'm Priya from WebCraft Solutions — we help businesses set up their online stores. Is this a good time to talk for two minutes?"`;
-
-// ─── Factory ──────────────────────────────────────────────────────────────────
-
-/**
- * Creates a new agent instance per WebSocket connection (per call).
- *
- * @param {WebSocket} ws  - Twilio media stream WebSocket
- * @returns {object}      - { handleTwilioMessage, handleCallEnd }
- */
 function createCallAgent(ws) {
-  let streamSid = null;
-  let callSid = null;
-  let toNumber = null;
-  let isSpeaking = false;          // True while bot is playing audio
-  let isProcessing = false;        // True while GPT-4o is running
-  let hotWhatsAppSent = false;     // Ensure mid-call WA fires only once
-  let callbackScheduled = false;   // Ensure callback fires only once
-  let interimBuffer = '';          // Accumulates interim transcripts
-  let finalBuffer = '';            // Accumulates final transcripts for context
-
-  // Full conversation log for follow-up
-  const conversationHistory = [];
-  const extractedData = { budget: null, timeline: null, features: null, callbackTime: null };
-
-  // ── STT setup ───────────────────────────────────────────────────────────────
-  const stt = createSTT((text, isFinal, isUtteranceEnd) => {
-    if (isFinal || isUtteranceEnd) {
-      const combined = (interimBuffer + ' ' + text).trim();
-      if (combined.length < 2) return;
-
-      // If bot is speaking, interrupt it
-      if (isSpeaking) {
-        clearTwilioAudio();
-        isSpeaking = false;
-      }
-
-      if (!isProcessing) {
-        finalBuffer = combined;
-        interimBuffer = '';
-        processUserTurn(combined);
-      }
-    } else {
-      // Accumulate interim results
-      interimBuffer = text;
-
-      // Interrupt bot if caller starts talking
-      if (isSpeaking && text.length > 3) {
-        clearTwilioAudio();
-        isSpeaking = false;
-      }
-    }
-  });
-
-  // ── GPT-4o conversation state ────────────────────────────────────────────────
+  let streamSid; let toNumber; let isSpeaking = false; let isProcessing = false;
+  let hotWhatsAppSent = false; let callbackScheduled = false; let ended = false; let interim = '';
+  let lastClassification = 'WARM';
+  const history = [];
+  const extracted = { budget: null, products: null, timeline: null, features: null, callbackTime: null };
   const messages = [{ role: 'system', content: SYSTEM_PROMPT }];
 
-  // ── Helpers ──────────────────────────────────────────────────────────────────
-
-  /** Send a clear event to Twilio to stop any buffered audio mid-stream. */
   function clearTwilioAudio() {
-    if (streamSid && ws.readyState === 1) {
-      ws.send(JSON.stringify({ event: 'clear', streamSid }));
-    }
+    if (streamSid && ws.readyState === 1) ws.send(JSON.stringify({ event: 'clear', streamSid }));
   }
-
-  /** Stream base64 audio chunks to Twilio. */
-  async function streamAudioToTwilio(audioBuffer) {
+  async function play(audio) {
     if (!streamSid || ws.readyState !== 1) return;
-
     isSpeaking = true;
-    const chunks = audioToTwilioChunks(audioBuffer);
-
-    for (const payload of chunks) {
-      if (!isSpeaking) break; // Interrupted
+    for (const payload of audioToTwilioChunks(audio)) {
+      if (!isSpeaking || ws.readyState !== 1) break;
       ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload } }));
-      // Small yield to allow interruption checks (non-blocking)
-      await new Promise((r) => setImmediate(r));
+      await new Promise((resolve) => setTimeout(resolve, 20));
     }
-
     isSpeaking = false;
   }
-
-  /** Call GPT-4o, parse response, speak, and trigger actions. */
-  async function processUserTurn(userText) {
-    if (isProcessing) return;
+  async function processTurn(text, isStart = false) {
+    if (isProcessing || ended) return;
     isProcessing = true;
+    if (!isStart) { history.push({ role: 'user', content: text }); messages.push({ role: 'user', content: text }); }
+    else messages.push({ role: 'user', content: 'CALL_STARTED' });
+    try {
+      // const completion = await groq.chat.completions.create({
+      //   model: process.env.GROQ_MODEL || 'qwen/qwen3.6-27b', messages, temperature: 0.35,
+      //   max_tokens: 350,
+      // });
+      const completion = await groq.chat.completions.create({
+  model: process.env.GROQ_MODEL || 'qwen/qwen3.6-27b',
+  messages,
+  temperature: 0.35,
+  max_tokens: 350,
+  reasoning_effort: 'none',
+  reasoning_format: 'hidden',
+  response_format: { type: 'json_object' },
+});
+      const parsed = safeJson(completion.choices[0]?.message?.content);
+      const forced = isStart ? null : deriveLeadSignal(text);
+      const classification = forced || normalizeClassification(parsed.classification);
+      lastClassification = classification;
+      ['budget', 'products', 'timeline', 'features', 'callbackTime'].forEach((key) => {
+        if (parsed[key] && String(parsed[key]).toLowerCase() !== 'null') extracted[key] = String(parsed[key]);
+      });
+      const speech = String(parsed.speech || 'Could you please repeat that?').trim();
+      messages.push({ role: 'assistant', content: JSON.stringify({ ...parsed, classification, speech }) });
+      history.push({ role: 'assistant', content: speech });
 
-    console.log(`[Agent] User said: "${userText}"`);
-    conversationHistory.push({ role: 'user', content: userText });
-    messages.push({ role: 'user', content: userText });
+      // This is deliberately triggered before TTS, so it can arrive during speech.
+      if (classification === 'HOT' && !hotWhatsAppSent && toNumber && !isStart) {
+        hotWhatsAppSent = true;
+        sendMidCallWhatsApp(toNumber, parsed.actionContext || text).catch((error) => console.error('[Agent] Mid-call WhatsApp failed:', error.message));
+      }
+      if (!isStart && !callbackScheduled && toNumber && (parsed.action === 'schedule_callback' || hasCallbackRequest(text))) {
+        callbackScheduled = true;
+        const booking = scheduleCallback(toNumber, parsed.callbackTime || text);
+        extracted.callbackTime = booking.humanReadable;
+      }
+      if (speech) await play(await textToSpeech(speech));
+    } catch (error) { console.error('[Agent] Turn failed:', error.message); }
+    finally { isProcessing = false; }
+  }
 
+  const stt = createSTT((text, isFinal, utteranceEnd) => {
+    if (!isFinal && !utteranceEnd) {
+      interim = text;
+      if (isSpeaking && text.length > 2) { clearTwilioAudio(); isSpeaking = false; }
+      return;
+    }
+    const combined = text || interim;
+    interim = '';
+    if (combined.trim().length < 2 || isProcessing) return;
+    if (isSpeaking) { clearTwilioAudio(); isSpeaking = false; }
+    processTurn(combined.trim());
+  });
+
+  async function handleCallEnd() {
+    if (ended) return;
+    ended = true; stt.close();
+    if (!toNumber || history.length === 0) return;
+    const transcript = history.map((item) => `${item.role === 'user' ? 'Prospect' : 'Priya'}: ${item.content}`).join('\n');
+    let contextSummary = transcript.slice(0, 900);
     try {
       const completion = await groq.chat.completions.create({
-        model: 'qwen/qwen3.6-27b',
-        messages,
-        temperature: 0.7,
-        max_tokens: 300,
-        response_format: { type: 'json_object' },
-      });
-
-      const raw = completion.choices[0].message.content;
-      let parsed;
-      try {
-        parsed = JSON.parse(raw);
-      } catch (_) {
-        // Fallback if GPT doesn't return valid JSON
-        parsed = { speech: raw, classification: 'WARM', action: 'none' };
-      }
-
-      const { speech, classification, action, actionContext, budget, timeline, features, callbackTime } = parsed;
-
-      // Log classification
-      console.log(`[Agent] Classification: ${classification} | Action: ${action}`);
-
-      // Update extracted data
-      if (budget) extractedData.budget = budget;
-      if (timeline) extractedData.timeline = timeline;
-      if (features) extractedData.features = features;
-      if (callbackTime) extractedData.callbackTime = callbackTime;
-
-      // Push assistant message back to GPT context
-      messages.push({ role: 'assistant', content: raw });
-      conversationHistory.push({ role: 'assistant', content: speech });
-
-      // ── Action: Mid-call WhatsApp (HOT) ──────────────────────────────────────
-      if (classification === 'HOT' && !hotWhatsAppSent && toNumber) {
-        hotWhatsAppSent = true;
-        console.log('[Agent] 🔥 HOT lead detected — firing mid-call WhatsApp');
-        // Fire async, don't block conversation
-        sendMidCallWhatsApp(toNumber, actionContext || userText).catch(console.error);
-      }
-
-      // ── Action: Schedule callback ─────────────────────────────────────────────
-      if (
-        (action === 'schedule_callback' || hasCallbackRequest(userText)) &&
-        !callbackScheduled &&
-        toNumber
-      ) {
-        callbackScheduled = true;
-        const result = scheduleCallback(toNumber, callbackTime || userText);
-        console.log(`[Agent] 📅 Callback scheduled: ${result.humanReadable}`);
-        extractedData.callbackTime = result.humanReadable;
-      }
-
-      // ── Speak the response ────────────────────────────────────────────────────
-      if (speech && speech.trim().length > 0) {
-        try {
-          const audioBuffer = await textToSpeech(speech);
-          await streamAudioToTwilio(audioBuffer);
-        } catch (ttsErr) {
-          console.error('[Agent] TTS error:', ttsErr.message);
-        }
-      }
-    } catch (err) {
-      console.error('[Agent] GPT-4o error:', err.message);
-    } finally {
-      isProcessing = false;
-    }
-  }
-
-  /** Called immediately when call connects — bot speaks the opening line. */
-  async function greet() {
-    console.log('[Agent] Call connected, sending greeting');
-    await processUserTurn('[CALL_STARTED]');
-  }
-
-  // ── Public interface ──────────────────────────────────────────────────────────
-
-  /**
-   * Handle incoming Twilio media stream events.
-   * @param {object} msg  - Parsed Twilio WebSocket message
-   */
-  function handleTwilioMessage(msg) {
-    switch (msg.event) {
-      case 'start':
-        streamSid = msg.start.streamSid;
-        callSid = msg.start.callSid;
-        // Extract the called number from custom parameters if available
-        toNumber = process.env.WHATSAPP_TARGET;
-        console.log(`[Agent] Stream started — SID: ${streamSid}`);
-        greet();
-        break;
-
-      case 'media':
-        // Decode base64 mulaw audio and send to Deepgram
-        const audioChunk = Buffer.from(msg.media.payload, 'base64');
-        stt.sendAudio(audioChunk);
-        break;
-
-      case 'stop':
-        console.log('[Agent] Stream stopped');
-        stt.close();
-        break;
-
-      default:
-        break;
-    }
-  }
-
-  /**
-   * Called when WebSocket closes (call ended).
-   * Sends follow-up WhatsApp with full context.
-   */
-  async function handleCallEnd() {
-    console.log('[Agent] Call ended — preparing follow-up WhatsApp');
-    stt.close();
-
-    // Build context summary from conversation history
-    const transcript = conversationHistory
-      .filter((m) => m.role !== 'system')
-      .map((m) => `${m.role === 'user' ? 'Prospect' : 'Agent'}: ${m.content}`)
-      .join('\n');
-
-    // Use GPT-4o to write a human follow-up summary
-    let contextSummary = transcript;
-    try {
-      const summaryCompletion = await groq.chat.completions.create({
-        model: 'qwen/qwen3.6-27b',
+        model: process.env.GROQ_MODEL || 'qwen/qwen3.6-27b',
+        temperature: 0.2,
+        max_tokens: 180,
         messages: [
           {
             role: 'system',
-            content:
-              'You write short, professional post-call WhatsApp summaries. ' +
-              'Write as if a real salesperson is summarizing the call to their manager. ' +
-              'Under 120 words. Reference specific things the prospect actually said.',
+            content: 'Write a warm, concise 2-3 sentence paragraph as Anurag summarizing the conversation with the prospect. Reference the exact specifics they mentioned (e.g. what they want to sell, their budget, timeline, or requested features). Write naturally like a real person following up after a phone call, not like a robotic log or generic template. Do not invent facts.'
           },
-          {
-            role: 'user',
-            content: `Transcript:\n${transcript}\n\nWrite the call summary now.`,
-          },
+          { role: 'user', content: transcript }
         ],
-        max_tokens: 200,
-        temperature: 0.5,
       });
-      contextSummary = summaryCompletion.choices[0].message.content;
-    } catch (err) {
-      console.error('[Agent] Summary generation failed:', err.message);
-    }
-
-    // Final classification from last assistant message
-    const lastMessages = messages.filter((m) => m.role === 'assistant').slice(-1);
-    let lastClassification = 'WARM';
-    if (lastMessages.length > 0) {
-      try {
-        const parsed = JSON.parse(lastMessages[0].content);
-        lastClassification = parsed.classification || 'WARM';
-      } catch (_) {}
-    }
-
-    if (toNumber) {
-      await sendFollowUpWhatsApp(toNumber, {
-        contextSummary,
-        classification: lastClassification,
-        ...extractedData,
-      });
-    }
+      contextSummary = completion.choices[0]?.message?.content?.trim() || contextSummary;
+    } catch (error) { console.error('[Agent] Summary failed:', error.message); }
+    await sendFollowUpWhatsApp(toNumber, { contextSummary, classification: lastClassification, ...extracted }).catch((error) => console.error('[Agent] Follow-up failed:', error.message));
   }
 
-  return { handleTwilioMessage, handleCallEnd };
+  return {
+    handleTwilioMessage(message) {
+      if (message.event === 'start') {
+        streamSid = message.start.streamSid;
+        toNumber = message.start.customParameters?.targetNumber || process.env.WHATSAPP_TARGET;
+        processTurn('', true);
+      } else if (message.event === 'media') stt.sendAudio(Buffer.from(message.media.payload, 'base64'));
+      else if (message.event === 'stop') handleCallEnd();
+    },
+    handleCallEnd,
+  };
 }
 
-module.exports = { createCallAgent };
+module.exports = { createCallAgent, safeJson };

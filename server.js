@@ -1,16 +1,6 @@
-/**
- * server.js
- * Entry point — Express HTTP + WebSocket server.
- *
- * Routes:
- *   POST /call          → Trigger outbound call to TARGET_NUMBER
- *   POST /twiml         → Return TwiML to start media stream (Twilio fetches this)
- *   POST /call-status   → Twilio status callback (logs call completion)
- *   GET  /health        → Health check
- *   WS   /stream        → Twilio media stream WebSocket
- */
-
+/** HTTP entry point and Twilio Media Stream gateway. */
 require('dotenv').config();
+const path = require('path');
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -20,121 +10,116 @@ const { createCallAgent } = require('./agent');
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
-
+app.use('/assets', express.static(path.join(__dirname, 'assets'), { index: false }));
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/stream' });
+const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-const client = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
+function publicBaseUrl() {
+  return String(process.env.SERVER_URL || '').replace(/\/$/, '');
+}
+function normalizeIndianNumber(value) {
+  const number = String(value || '').trim();
+  if (!number) throw new Error('A destination number is required');
+  if (number.startsWith('+')) return number;
+  const digits = number.replace(/\D/g, '');
+  if (digits.length === 10) return `+91${digits}`;
+  throw new Error('Use an E.164 number or a 10-digit Indian mobile number');
+}
+function requiredConfiguration() {
+  return ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_PHONE_NUMBER', 'SERVER_URL'].filter((key) => !process.env[key]);
+}
 
-// ─── HTTP Routes ──────────────────────────────────────────────────────────────
-
-/** Health check */
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', time: new Date().toISOString() });
-});
-
-/**
- * POST /call
- * Body (optional): { to: "7054728625" }
- * Triggers an outbound call. Defaults to TARGET_NUMBER in .env.
- */
+app.get('/health', (_req, res) => res.json({ status: 'ok', configured: requiredConfiguration().length === 0, missing: requiredConfiguration(), time: new Date().toISOString() }));
 app.post('/call', async (req, res) => {
-  const rawNumber = req.body.to || process.env.TARGET_NUMBER;
-  // Normalise to E.164 (+91 prefix for Indian numbers if not already set)
-  const toNumber = rawNumber.startsWith('+') ? rawNumber : `+91${rawNumber}`;
-
-  console.log(`[Server] Initiating call to ${toNumber}`);
-
+  const missing = requiredConfiguration();
+  if (missing.length) return res.status(400).json({ success: false, error: `Missing configuration: ${missing.join(', ')}` });
+  let to;
+  try { to = normalizeIndianNumber(req.body.to || process.env.TARGET_NUMBER); }
+  catch (error) { return res.status(400).json({ success: false, error: error.message }); }
   try {
     const call = await client.calls.create({
-      url: `${process.env.SERVER_URL}/twiml`,
-      to: toNumber,
-      from: process.env.TWILIO_PHONE_NUMBER,
+      to, from: process.env.TWILIO_PHONE_NUMBER, url: `${publicBaseUrl()}/twiml`, method: 'POST',
+      statusCallback: `${publicBaseUrl()}/call-status`, statusCallbackMethod: 'POST', statusCallbackEvent: ['completed'],
     });
-
-    console.log(`[Server] Call created — SID: ${call.sid}`);
-    res.json({ success: true, callSid: call.sid, to: toNumber });
-  } catch (err) {
-    console.error('[Server] Call creation failed:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(201).json({ success: true, callSid: call.sid, to });
+  } catch (error) {
+    console.error('[Server] Outbound call failed:', error.message);
+    res.status(502).json({ success: false, error: error.message });
   }
 });
-
-/**
- * POST /twiml
- * Twilio fetches this when the call is answered.
- * Returns TwiML that starts a bi-directional media stream to our WebSocket.
- */
 app.post('/twiml', (req, res) => {
-  // Use wss:// if SERVER_URL is https, ws:// if http
-  const wsUrl = process.env.SERVER_URL.replace(/^https/, 'wss').replace(/^http/, 'ws');
-
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="${wsUrl}/stream">
-      <Parameter name="targetNumber" value="${process.env.WHATSAPP_TARGET}" />
-    </Stream>
-  </Connect>
-</Response>`;
-
-  console.log('[Server] Serving TwiML for incoming answer');
-  res.type('text/xml').send(twiml);
+  const base = publicBaseUrl();
+  if (!base) return res.status(500).type('text/plain').send('SERVER_URL is not configured');
+  const wsUrl = base.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:');
+  let target;
+  try {
+    target = normalizeIndianNumber(req.body.Called || req.body.To || req.query.to || process.env.WHATSAPP_TARGET || process.env.TARGET_NUMBER);
+  } catch (_) {
+    target = normalizeIndianNumber(process.env.WHATSAPP_TARGET || process.env.TARGET_NUMBER);
+  }
+  res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="${wsUrl}/stream"><Parameter name="targetNumber" value="${target}" /></Stream></Connect></Response>`);
 });
-
-/**
- * POST /call-status
- * Twilio status callback — logs call lifecycle events.
- */
 app.post('/call-status', (req, res) => {
-  const { CallSid, CallStatus, CallDuration } = req.body;
-  console.log(`[Server] Call status — SID: ${CallSid} | Status: ${CallStatus} | Duration: ${CallDuration}s`);
-  res.sendStatus(200);
+  console.log(`[Server] ${req.body.CallSid || 'unknown'}: ${req.body.CallStatus || 'unknown'} (${req.body.CallDuration || 0}s)`);
+  res.sendStatus(204);
 });
 
-// ─── WebSocket — Twilio Media Stream ─────────────────────────────────────────
-
-wss.on('connection', (ws, req) => {
-  console.log('[Server] New WebSocket connection from Twilio');
-
+wss.on('connection', (ws) => {
   const agent = createCallAgent(ws);
-
   ws.on('message', (data) => {
-    try {
-      const msg = JSON.parse(data.toString());
-      agent.handleTwilioMessage(msg);
-    } catch (err) {
-      console.error('[Server] WebSocket message parse error:', err.message);
-    }
+    try { agent.handleTwilioMessage(JSON.parse(data.toString())); }
+    catch (error) { console.error('[Server] Bad stream event:', error.message); }
   });
+  ws.on('close', () => agent.handleCallEnd().catch((error) => console.error('[Server] End-of-call error:', error.message)));
+  ws.on('error', (error) => console.error('[Server] Stream error:', error.message));
+});
+wss.on('error', (error) => console.error('[Server] WebSocket listener error:', error.message));
 
-  ws.on('close', () => {
-    console.log('[Server] WebSocket closed — call ended');
-    agent.handleCallEnd().catch(console.error);
-  });
+const port = Number(process.env.PORT || 3000);
+server.on('error', (error) => console.error('[Server] HTTP listener error:', error.message));
+if (require.main === module) server.listen(port, () => console.log(`[Server] Listening on :${port}`));
+module.exports = { app, server, normalizeIndianNumber, requiredConfiguration };
 
-  ws.on('error', (err) => {
-    console.error('[Server] WebSocket error:', err.message);
-  });
+app.post('/trial-twiml', (_req, res) => {
+  res.type('text/xml').send(`
+    <?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+      <Gather
+        input="speech"
+        action="${publicBaseUrl()}/trial-response"
+        method="POST"
+        speechTimeout="auto"
+        language="en-IN"
+      >
+        <Say>
+          Hello Anurag. This is a test of your ElevateBox voice agent.
+          Please say something after the beep.
+        </Say>
+      </Gather>
+
+      <Say>
+        I did not hear anything. Goodbye.
+      </Say>
+
+      <Hangup/>
+    </Response>
+  `);
 });
 
-// ─── Start ────────────────────────────────────────────────────────────────────
+app.post('/trial-response', (req, res) => {
+  console.log('[Trial] Speech received:', req.body.SpeechResult);
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log('');
-  console.log('╔══════════════════════════════════════════════════════╗');
-  console.log('║     ElevateBox AI Voice Agent — Server Running       ║');
-  console.log(`║     Port: ${PORT}                                        ║`);
-  console.log(`║     Webhook: ${process.env.SERVER_URL || 'Set SERVER_URL in .env'}  ║`);
-  console.log('╠══════════════════════════════════════════════════════╣');
-  console.log(`║     Test number:  ${process.env.TARGET_NUMBER || 'Set TARGET_NUMBER in .env'}               ║`);
-  console.log('╠══════════════════════════════════════════════════════╣');
-  console.log('║  To trigger a call:                                  ║');
-  console.log('║    curl -X POST http://localhost:3000/call           ║');
-  console.log('╚══════════════════════════════════════════════════════╝');
-  console.log('');
+  res.type('text/xml').send(`
+    <?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+      <Say>
+        I heard you say: ${String(req.body.SpeechResult || 'nothing').replace(/[<>&'"]/g, '')}
+      </Say>
+      <Say>
+        The Twilio trial integration is working. Goodbye.
+      </Say>
+      <Hangup/>
+    </Response>
+  `);
 });

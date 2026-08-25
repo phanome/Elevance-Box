@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">ElevateBox voice agent architecture</title>
+  <desc id="desc">Outbound call flows through Twilio, real-time transcription, the sales decision engine and voice synthesis. The decision engine can send WhatsApp during the call, schedule a callback, and send a contextual follow-up after the call.</desc>
+  <style>
+    .bg{fill:#0b1020}.title{font:700 44px Arial,sans-serif;fill:#f8fafc}.sub{font:22px Arial,sans-serif;fill:#a5b4fc}.box{fill:#172554;stroke:#60a5fa;stroke-width:3}.action{fill:#3f1d4f;stroke:#f0abfc;stroke-width:3}.text{font:700 25px Arial,sans-serif;fill:#f8fafc}.small{font:19px Arial,sans-serif;fill:#cbd5e1}.arrow{stroke:#93c5fd;stroke-width:5;fill:none;marker-end:url(#arrow)}
+  </style>
+  <defs><marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 Z" fill="#93c5fd"/></marker></defs>
+  <rect class="bg" width="1600" height="900" rx="36"/>
+  <text class="title" x="800" y="75" text-anchor="middle">ElevateBox AI Voice Agent</text>
+  <text class="sub" x="800" y="112" text-anchor="middle">A live conversation drives actions before the call ends</text>
+  <g transform="translate(55 280)"><rect class="box" width="205" height="145" rx="20"/><text class="text" x="102" y="58" text-anchor="middle">Twilio</text><text class="small" x="102" y="90" text-anchor="middle">outbound call</text><text class="small" x="102" y="117" text-anchor="middle">Media Stream</text></g>
+  <g transform="translate(335 280)"><rect class="box" width="205" height="145" rx="20"/><text class="text" x="102" y="58" text-anchor="middle">Deepgram</text><text class="small" x="102" y="90" text-anchor="middle">multilingual</text><text class="small" x="102" y="117" text-anchor="middle">live STT</text></g>
+  <g transform="translate(615 230)"><rect class="box" width="370" height="245" rx="20"/><text class="text" x="185" y="57" text-anchor="middle">Sales decision engine</text><text class="small" x="185" y="98" text-anchor="middle">Groq LLM + intent guardrails</text><text class="small" x="185" y="132" text-anchor="middle">language • discovery • Hot/Warm/Cold</text><text class="small" x="185" y="166" text-anchor="middle">budget • products • timeline • features</text><text class="small" x="185" y="205" text-anchor="middle">barge-in safe conversation state</text></g>
+  <g transform="translate(1060 280)"><rect class="box" width="205" height="145" rx="20"/><text class="text" x="102" y="58" text-anchor="middle">ElevenLabs</text><text class="small" x="102" y="90" text-anchor="middle">Hindi / Telugu</text><text class="small" x="102" y="117" text-anchor="middle">English TTS</text></g>
+  <g transform="translate(1340 280)"><rect class="box" width="205" height="145" rx="20"/><text class="text" x="102" y="58" text-anchor="middle">Caller</text><text class="small" x="102" y="90" text-anchor="middle">natural</text><text class="small" x="102" y="117" text-anchor="middle">conversation</text></g>
+  <path class="arrow" d="M260 352H330M540 352H610M985 352H1055M1265 352H1335"/>
+  <g transform="translate(350 635)"><rect class="action" width="285" height="140" rx="20"/><text class="text" x="142" y="56" text-anchor="middle">WhatsApp now</text><text class="small" x="142" y="89" text-anchor="middle">HOT intent fires</text><text class="small" x="142" y="116" text-anchor="middle">while caller is live</text></g>
+  <g transform="translate(660 635)"><rect class="action" width="285" height="140" rx="20"/><text class="text" x="142" y="56" text-anchor="middle">Callback scheduler</text><text class="small" x="142" y="89" text-anchor="middle">spoken time → IST</text><text class="small" x="142" y="116" text-anchor="middle">outbound call</text></g>
+  <g transform="translate(970 635)"><rect class="action" width="285" height="140" rx="20"/><text class="text" x="142" y="56" text-anchor="middle">Follow-up</text><text class="small" x="142" y="89" text-anchor="middle">context + resume</text><text class="small" x="142" y="116" text-anchor="middle">+ build image</text></g>
+  <path class="arrow" d="M800 480V580H492V630M800 480V630M800 580H1112V630"/>
+</svg>
