@@ -46,6 +46,17 @@ Set `BUILD_IMAGE_URL` only if you prefer a different public architecture image. 
 
 ## Submission note (under 200 words)
 
-The prototype makes the outbound call itself and keeps a bidirectional Twilio Media Stream open for the conversation. Deepgram transcribes in real time; the LLM keeps language and sales context while rule-based signals protect key Hot, Warm, and Cold decisions. A Hot signal sends WhatsApp asynchronously before the agent speaks its next reply, while callback phrases are converted to an IST time and scheduled. After the call the system writes a concise, specific follow-up and attaches the resume and architecture diagram.
+**What Works**
+- Outbound call + real-time voice pipeline — Twilio dials the target, Deepgram transcribes live audio (English/Hindi/Telugu).
+- Lead qualification — rule-based intent guardrails layered over the LLM reliably classify HOT/WARM/COLD without hallucinating the label aloud.
+- Mid-call SMS alert — fires before Priya speaks her next line, so the recruiter gets a live signal while the prospect is still on the call.
+- Post-call follow-up SMS — AI-generated, specific to what was discussed, with resume and repo links attached.
+- Callback scheduling — spoken times parsed to IST and redialed automatically via cron.
 
-Before a live submission I would move callback jobs from process memory to a durable queue, add authenticated webhook signature validation, persist call records, and add end-to-end tests with Twilio test credentials. A live run still requires the supplied API keys, a public HTTPS URL, a verified Twilio destination, and WhatsApp sandbox opt-in when using the sandbox.
+**What Does Not**
+- The Twilio WhatsApp Sandbox can only send messages to numbers that have first texted a join code to Twilio — so you can't message a stranger's WhatsApp cold without their prior opt-in. SMS covers this but lacks rich media.
+
+**What I Would Build Next**
+- Move callbacks to a durable queue (Redis + BullMQ).
+- Persist call records and transcripts to a database.
+- Add end-to-end tests using Twilio test credentials.
