@@ -29,7 +29,7 @@ async function sendMidCallWhatsApp(toNumber, context) {
     console.error(`[WhatsApp] Mid-call failed (${error.code}): ${error.message}`);
   }
 
-  // 2. Also send SMS directly (guaranteed delivery for numbers not in WhatsApp sandbox)
+  
   if (process.env.TWILIO_PHONE_NUMBER) {
     try {
       const sms = await client.messages.create({
@@ -58,16 +58,33 @@ async function sendFollowUpWhatsApp(toNumber, summary) {
     summary.callbackTime ? `• Scheduled Callback: ${summary.callbackTime}` : null,
   ].filter(Boolean).join('\n');
 
+  const submissionNote =
+    `---\n` +
+    `*What Works*\n` +
+    `• Outbound call + real-time voice pipeline — Twilio dials the target, Deepgram transcribes live audio (English/Hindi/Telugu).\n` +
+    `• Lead qualification — rule-based intent guardrails layered over the LLM reliably classify HOT/WARM/COLD without hallucinating the label aloud.\n` +
+    `• Mid-call SMS alert — fires before Priya speaks her next line, so the recruiter gets a live signal while the prospect is still on the call.\n` +
+    `• Post-call follow-up SMS — AI-generated, specific to what was discussed, with resume and repo links attached.\n` +
+    `• Callback scheduling — spoken times parsed to IST and redialed automatically via cron.\n\n` +
+    `*What Does Not*\n` +
+    `• The Twilio WhatsApp Sandbox can only send messages to numbers that have first texted a join code to Twilio — so you can't message a stranger's WhatsApp cold without prior opt-in. SMS covers this but lacks rich media.\n\n` +
+    `*What I Would Build Next*\n` +
+    `• Move callbacks to a durable queue (Redis + BullMQ).\n` +
+    `• Persist call records and transcripts to a database.\n` +
+    `• Add end-to-end tests using Twilio test credentials.`;
+
   const body = `Hi, thank you for taking the time to speak with Priya earlier today!\n\n` +
     `${summary.contextSummary}\n\n` +
     (requirementsList ? `📌 *Key Discussion Points:*\n${requirementsList}\n\n` : '') +
     `📞 *My Direct Number:* ${myMobile}\n` +
     `📄 *My Resume:* ${resumeUrl}\n` +
-    `🛠️ *System Architecture & Build:* ${buildPdfUrl}\n\n` +
+    `🛠️ *System Architecture & Build:* ${buildPdfUrl}\n` +
+    `💻 *Source Code:* https://github.com/phanome/Elevance-Box\n\n` +
+    `${submissionNote}\n\n` +
     `Feel free to call or WhatsApp me directly anytime. Looking forward to connecting further!\n\n` +
     `Best regards,\n${myName}`;
 
-  // 1. Send WhatsApp message
+  
   try {
     const message = await client.messages.create({
       from: process.env.WHATSAPP_FROM || 'whatsapp:+14155238886',
@@ -79,7 +96,7 @@ async function sendFollowUpWhatsApp(toNumber, summary) {
     console.error(`[WhatsApp] Follow-up failed (${error.code}): ${error.message}`);
   }
 
-  // 2. Also send SMS directly (guaranteed delivery for numbers not in WhatsApp sandbox)
+  
   if (process.env.TWILIO_PHONE_NUMBER) {
     try {
       const sms = await client.messages.create({
