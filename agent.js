@@ -85,7 +85,7 @@ function createCallAgent(ws) {
       messages.push({ role: 'assistant', content: JSON.stringify({ ...parsed, classification, speech }) });
       history.push({ role: 'assistant', content: speech });
 
-      // This is deliberately triggered before TTS, so it can arrive during speech.
+     
       if (classification === 'HOT' && !hotWhatsAppSent && toNumber && !isStart) {
         hotWhatsAppSent = true;
         sendMidCallWhatsApp(toNumber, parsed.actionContext || text).catch((error) => console.error('[Agent] Mid-call WhatsApp failed:', error.message));
