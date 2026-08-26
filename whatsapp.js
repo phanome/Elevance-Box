@@ -97,14 +97,50 @@ async function sendFollowUpWhatsApp(toNumber, summary) {
   }
 
   
+  // 2. Also send SMS directly (guaranteed delivery for numbers not in WhatsApp sandbox)
   if (process.env.TWILIO_PHONE_NUMBER) {
+    const formattedTo = toNumber.startsWith('+') ? toNumber : `+91${toNumber.replace(/\D/g, '')}`;
+    
+    // SMS Part 1: Discussion Summary, Portfolio & Links
+    const smsPart1 = `Hi, thank you for taking the time to speak with Priya earlier today!\n\n` +
+      `${summary.contextSummary}\n\n` +
+      (requirementsList ? `📌 Key Discussion Points:\n${requirementsList}\n\n` : '') +
+      `📞 My Direct Number: ${myMobile}\n` +
+      `📄 My Resume: ${resumeUrl}\n` +
+      `🛠️ System Architecture & Build: ${buildPdfUrl}\n` +
+      `💻 Source Code: https://github.com/phanome/Elevance-Box\n\n` +
+      `Feel free to call or WhatsApp me directly anytime. Looking forward to connecting further!\n\n` +
+      `Best regards,\n${myName}`;
+
+    // SMS Part 2: Technical Submission Note (<200 words)
+    const smsPart2 = `📝 ElevateBox Assignment - Technical Submission Note:\n\n` +
+      `What Works:\n` +
+      `• Outbound call + real-time voice pipeline (Twilio + Deepgram STT + ElevenLabs TTS)\n` +
+      `• Lead qualification — deterministic intent guardrails + LLM classify HOT/WARM/COLD\n` +
+      `• Mid-call SMS alert on high buying intent\n` +
+      `• Post-call automated summary & follow-up SMS\n` +
+      `• Natural language callback scheduling to IST with cron auto-redial\n\n` +
+      `What Does Not:\n` +
+      `• Twilio WhatsApp sandbox requires recipient opt-in; SMS fallback covers this directly\n\n` +
+      `What I Would Build Next:\n` +
+      `• Move callbacks to durable Redis/BullMQ queue\n` +
+      `• Persist call logs & transcripts to database\n` +
+      `• Add end-to-end tests with Twilio test credentials`;
+
     try {
-      const sms = await client.messages.create({
+      const sms1 = await client.messages.create({
         from: process.env.TWILIO_PHONE_NUMBER,
-        to: toNumber.startsWith('+') ? toNumber : `+91${toNumber.replace(/\D/g, '')}`,
-        body: body.replace(/\*/g, ''),
+        to: formattedTo,
+        body: smsPart1,
       });
-      console.log(`[SMS] Follow-up sent via SMS: ${sms.sid}`);
+      console.log(`[SMS] Follow-up Part 1 sent via SMS: ${sms1.sid}`);
+
+      const sms2 = await client.messages.create({
+        from: process.env.TWILIO_PHONE_NUMBER,
+        to: formattedTo,
+        body: smsPart2,
+      });
+      console.log(`[SMS] Follow-up Part 2 (Submission Note) sent via SMS: ${sms2.sid}`);
     } catch (smsError) {
       console.error(`[SMS] Follow-up SMS failed: ${smsError.message}`);
     }
