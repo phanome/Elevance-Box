@@ -19,11 +19,12 @@ function publicBaseUrl() {
   return String(process.env.SERVER_URL || '').replace(/\/$/, '');
 }
 function normalizeIndianNumber(value) {
-  const number = String(value || '').trim();
-  if (!number) throw new Error('A destination number is required');
-  if (number.startsWith('+')) return number;
-  const digits = number.replace(/\D/g, '');
+  const raw = String(value || '').trim();
+  if (!raw) throw new Error('A destination number is required');
+  const digits = raw.replace(/\D/g, '');
   if (digits.length === 10) return `+91${digits}`;
+  if (digits.length === 12 && digits.startsWith('91')) return `+${digits}`;
+  if (raw.startsWith('+')) return `+${digits}`;
   throw new Error('Use an E.164 number or a 10-digit Indian mobile number');
 }
 function requiredConfiguration() {
